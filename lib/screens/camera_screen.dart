@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:path/path.dart' as path;
-import 'package:path_provider/path_provider.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'dart:io';
+import 'dart:async';
+import 'dart:typed_data';
 
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -14,9 +15,12 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> {
   CameraController? _controller;
   List<CameraDescription>? _cameras;
-  bool _isLoading = true;
-  String? _errorMessage;
-  bool _isCapturing = false;
+  bool _isInitialized = false;
+  bool _isRecording = false;
+  bool _isUploading = false;
+  Timer? _recordingTimer;
+  int _recordingSeconds = 0;
+  static const int _maxRecordingSeconds = 15;
 
   @override
   void initState() {
@@ -26,258 +30,365 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Future<void> _initializeCamera() async {
     try {
-      // Obtener las cámaras disponibles
       _cameras = await availableCameras();
-      
-      if (_cameras == null || _cameras!.isEmpty) {
-        setState(() {
-          _errorMessage = 'No se encontraron cámaras disponibles';
-          _isLoading = false;
-        });
-        return;
+      if (_cameras!.isNotEmpty) {
+        _controller = CameraController(
+          _cameras![0], // Usar la cámara trasera por defecto
+          ResolutionPreset.high,
+          enableAudio: true,
+        );
+        
+        await _controller!.initialize();
+        if (mounted) {
+          setState(() {
+            _isInitialized = true;
+          });
+        }
       }
-
-      // Usar la primera cámara (generalmente la trasera)
-      _controller = CameraController(
-        _cameras![0],
-        ResolutionPreset.high,
-      );
-
-      await _controller!.initialize();
-      
-      setState(() {
-        _isLoading = false;
-      });
     } catch (e) {
-      setState(() {
-        _errorMessage = 'Error al inicializar la cámara: $e';
-        _isLoading = false;
-      });
+      print('Error inicializando cámara: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al inicializar la cámara: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
-  Future<void> _takePicture() async {
-    if (_controller == null || !_controller!.value.isInitialized) {
-      return;
-    }
+  Future<void> _startRecording() async {
+    if (_controller == null || !_controller!.value.isInitialized) return;
 
+    try {
+      await _controller!.startVideoRecording();
+      setState(() {
+        _isRecording = true;
+        _recordingSeconds = 0;
+      });
+
+      // Iniciar el temporizador
+      _recordingTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+        setState(() {
+          _recordingSeconds++;
+        });
+
+        // Detener automáticamente después de 15 segundos
+        if (_recordingSeconds >= _maxRecordingSeconds) {
+          _stopRecording();
+        }
+      });
+    } catch (e) {
+      print('Error iniciando grabación: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error al iniciar grabación: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> _stopRecording() async {
+    if (_controller == null || !_isRecording) return;
+
+    try {
+      _recordingTimer?.cancel();
+      final XFile videoFile = await _controller!.stopVideoRecording();
+      
+      setState(() {
+        _isRecording = false;
+        _recordingSeconds = 0;
+      });
+
+      // Mostrar diálogo de confirmación
+      _showUploadDialog(videoFile);
+    } catch (e) {
+      print('Error deteniendo grabación: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error al detener grabación: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  void _showUploadDialog(XFile videoFile) {
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Video grabado'),
+          content: const Text('¿Deseas subir el video a Supabase Storage?'),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                // Eliminar el archivo temporal
+                File(videoFile.path).delete();
+              },
+              child: const Text('Cancelar'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _uploadVideo(videoFile);
+              },
+              child: const Text('Subir'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _uploadVideo(XFile videoFile) async {
     setState(() {
-      _isCapturing = true;
+      _isUploading = true;
     });
 
     try {
-      final XFile photo = await _controller!.takePicture();
+      final user = Supabase.instance.client.auth.currentUser;
+      if (user == null) {
+        throw Exception('Usuario no autenticado');
+      }
+
+      // Crear un nombre único para el archivo
+      final String fileName = 'video_${user.id}_${DateTime.now().millisecondsSinceEpoch}.mp4';
       
-      // Obtener el directorio de documentos
-      final Directory appDocDir = await getApplicationDocumentsDirectory();
-      final String dirPath = '${appDocDir.path}/Pictures';
-      await Directory(dirPath).create(recursive: true);
-      
-      // Crear nombre único para la foto
-      final String fileName = '${DateTime.now().millisecondsSinceEpoch}.jpg';
-      final String filePath = path.join(dirPath, fileName);
-      
-      // Guardar la foto
-      await File(photo.path).copy(filePath);
-      
-      if (!mounted) return;
-      
-      // Mostrar mensaje de éxito
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Foto guardada: $fileName'),
-          backgroundColor: Colors.green,
-          duration: const Duration(seconds: 2),
-        ),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error al tomar la foto: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    } finally {
-      setState(() {
-        _isCapturing = false;
+      // Leer el archivo como bytes
+      final File file = File(videoFile.path);
+      final List<int> bytes = await file.readAsBytes();
+
+      // Subir a Supabase Storage
+      final String path = await Supabase.instance.client.storage
+          .from('videos')
+          .uploadBinary(fileName, bytes);
+
+      // Insertar registro en la tabla videos
+      await Supabase.instance.client.from('videos').insert({
+        'user_id': user.id,
+        'file_name': fileName,
+        'file_path': path,
+        'created_at': DateTime.now().toIso8601String(),
       });
+
+      // Eliminar archivo temporal
+      await file.delete();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('¡Video subido exitosamente!'),
+            backgroundColor: Colors.green,
+          ),
+        );
+        Navigator.pop(context);
+      }
+    } catch (e) {
+      print('Error subiendo video: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error al subir video: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUploading = false;
+        });
+      }
     }
   }
 
-  Future<void> _switchCamera() async {
-    if (_cameras == null || _cameras!.length <= 1) return;
+  void _switchCamera() async {
+    if (_cameras == null || _cameras!.length < 2) return;
+
+    final currentCameraIndex = _cameras!.indexOf(_controller!.description);
+    final newCameraIndex = (currentCameraIndex + 1) % _cameras!.length;
+
+    await _controller?.dispose();
+    
+    _controller = CameraController(
+      _cameras![newCameraIndex],
+      ResolutionPreset.high,
+      enableAudio: true,
+    );
 
     try {
-      // Encontrar la siguiente cámara
-      final currentCameraIndex = _cameras!.indexOf(_controller!.description);
-      final nextCameraIndex = (currentCameraIndex + 1) % _cameras!.length;
-      
-      // Disponer del controlador actual
-      await _controller?.dispose();
-      
-      // Crear nuevo controlador con la siguiente cámara
-      _controller = CameraController(
-        _cameras![nextCameraIndex],
-        ResolutionPreset.high,
-      );
-      
       await _controller!.initialize();
-      setState(() {});
+      if (mounted) {
+        setState(() {});
+      }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error al cambiar cámara: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
+      print('Error cambiando cámara: $e');
     }
+  }
+
+  String _formatTime(int seconds) {
+    final minutes = seconds ~/ 60;
+    final remainingSeconds = seconds % 60;
+    return '${minutes.toString().padLeft(2, '0')}:${remainingSeconds.toString().padLeft(2, '0')}';
   }
 
   @override
   void dispose() {
+    _recordingTimer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (!_isInitialized) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+
     return Scaffold(
+      backgroundColor: Colors.black,
       appBar: AppBar(
-        title: const Text('Cámara'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        actions: [
-          if (_cameras != null && _cameras!.length > 1)
-            IconButton(
-              icon: const Icon(Icons.flip_camera_ios),
-              onPressed: _switchCamera,
-              tooltip: 'Cambiar cámara',
-            ),
-        ],
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+        title: const Text(
+          'Grabar Video',
+          style: TextStyle(color: Colors.white),
+        ),
       ),
-      body: _buildBody(),
-      floatingActionButton: _controller != null && _controller!.value.isInitialized
-          ? FloatingActionButton(
-              onPressed: _isCapturing ? null : _takePicture,
-              backgroundColor: _isCapturing ? Colors.grey : null,
-              child: _isCapturing
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
-                    )
-                  : const Icon(Icons.camera),
-            )
-          : null,
-      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
-    );
-  }
-
-  Widget _buildBody() {
-    if (_isLoading) {
-      return const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 16),
-            Text('Inicializando cámara...'),
-          ],
-        ),
-      );
-    }
-
-    if (_errorMessage != null) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(20.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(
-                Icons.error_outline,
-                size: 64,
-                color: Colors.red,
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Error',
-                style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                _errorMessage!,
-                textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 16),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: () {
-                  setState(() {
-                    _isLoading = true;
-                    _errorMessage = null;
-                  });
-                  _initializeCamera();
-                },
-                child: const Text('Reintentar'),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (_controller != null && _controller!.value.isInitialized) {
-      return Stack(
+      body: Stack(
         children: [
           // Vista previa de la cámara
           Positioned.fill(
             child: CameraPreview(_controller!),
           ),
-          // Overlay con información
-          Positioned(
-            top: 20,
-            left: 20,
-            right: 20,
-            child: Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.6),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text(
-                    'Toca el botón para capturar',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 14,
+          
+          // Overlay con controles
+          Positioned.fill(
+            child: Column(
+              children: [
+                // Indicador de grabación y temporizador
+                if (_isRecording)
+                  Container(
+                    margin: const EdgeInsets.all(16),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.red,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.fiber_manual_record,
+                          color: Colors.white,
+                          size: 16,
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          'REC ${_formatTime(_recordingSeconds)}',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                  Icon(
-                    _controller!.description.lensDirection == CameraLensDirection.back
-                        ? Icons.camera_rear
-                        : Icons.camera_front,
-                    color: Colors.white,
-                    size: 20,
+                
+                const Spacer(),
+                
+                // Controles inferiores
+                Container(
+                  padding: const EdgeInsets.all(32),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      // Botón cambiar cámara
+                      if (_cameras != null && _cameras!.length > 1)
+                        IconButton(
+                          onPressed: _isRecording ? null : _switchCamera,
+                          icon: const Icon(
+                            Icons.flip_camera_ios,
+                            color: Colors.white,
+                            size: 32,
+                          ),
+                        )
+                      else
+                        const SizedBox(width: 48),
+                      
+                      // Botón grabar/detener
+                      GestureDetector(
+                        onTap: _isUploading 
+                            ? null 
+                            : (_isRecording ? _stopRecording : _startRecording),
+                        child: Container(
+                          width: 80,
+                          height: 80,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _isRecording ? Colors.red : Colors.white,
+                            border: Border.all(
+                              color: Colors.white,
+                              width: 4,
+                            ),
+                          ),
+                          child: _isUploading
+                              ? const CircularProgressIndicator(
+                                  color: Colors.red,
+                                  strokeWidth: 3,
+                                )
+                              : Icon(
+                                  _isRecording ? Icons.stop : Icons.videocam,
+                                  color: _isRecording ? Colors.white : Colors.red,
+                                  size: 32,
+                                ),
+                        ),
+                      ),
+                      
+                      // Espacio para simetría
+                      const SizedBox(width: 48),
+                    ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
+          
+          // Indicador de carga
+          if (_isUploading)
+            Container(
+              color: Colors.black54,
+              child: const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(color: Colors.white),
+                    SizedBox(height: 16),
+                    Text(
+                      'Subiendo video...',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
-      );
-    }
-
-    return const Center(
-      child: Text('Error inesperado'),
+      ),
     );
   }
 }
