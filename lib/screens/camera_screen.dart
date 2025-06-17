@@ -158,14 +158,15 @@ class _CameraScreenState extends State<CameraScreen> {
       // Crear un nombre único para el archivo
       final String fileName = 'video_${user.id}_${DateTime.now().millisecondsSinceEpoch}.mp4';
       
-      // Leer el archivo como bytes
+      // Leer el archivo como bytes y convertir a Uint8List
       final File file = File(videoFile.path);
       final List<int> bytes = await file.readAsBytes();
+      final Uint8List uint8ListBytes = Uint8List.fromList(bytes);
 
       // Subir a Supabase Storage
       final String path = await Supabase.instance.client.storage
           .from('videos')
-          .uploadBinary(fileName, bytes);
+          .uploadBinary(fileName, uint8ListBytes);
 
       // Insertar registro en la tabla videos
       await Supabase.instance.client.from('videos').insert({
